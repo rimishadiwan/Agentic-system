@@ -65,4 +65,42 @@ async function generateContent(ai, request) {
   throw e;
 }
 
-module.exports = { getModel, getModels, generateContent, DEFAULT_MODEL };
+/* ---------- transient-error retry (503 / 429 / 500 / network) ---------- */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Temporary failures worth retrying: overload, rate limit, server error, network blip.
+function isTransient(err) {
+  if (!err || err.permanent) return false;
+  const status = Number(err.status ?? err.code ?? err.error?.code);
+  if ([429, 500, 502, 503, 504].includes(status)) return true;
+  const m = String(err.message || "").toLowerCase();
+  return /\b(429|500|502|503|504)\b|unavailable|high demand|overloaded|timeout|timed out|fetch failed|econnreset|etimedout|socket hang up/.test(m);
+}
+
+/*
+  generateContent + retry with exponential backoff and jitter.
+  Waits ~0.7s, ~1.4s between attempts, so the total stays well under a proxy / Render timeout.
+  Each retry rotates to the next model in GEMINI_MODEL + GEMINI_FALLBACK_MODELS (if configured).
+  Throws the last error with err.transient = true when it was a temporary failure.
+*/
+async function generateWithRetry(ai, request, { retries = 2, baseDelayMs = 700 } = {}) {
+  const models = getModels(request.model);
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await generateContent(ai, { ...request, model: models[attempt % models.length] });
+    } catch (err) {
+      const transient = isTransient(err);
+      if (!transient || attempt === retries) {
+        if (transient) err.transient = true;
+        throw err;
+      }
+      const wait = baseDelayMs * 2 ** attempt + Math.random() * 300;
+      console.warn(`Gemini transient error (attempt ${attempt + 1}/${retries + 1}), retrying in ${Math.round(wait)}ms:`, String(err.message).slice(0, 120));
+      await sleep(wait);
+    }
+  }
+}
+
+module.exports = { getModel, getModels, generateContent, generateWithRetry, isTransient, DEFAULT_MODEL };
