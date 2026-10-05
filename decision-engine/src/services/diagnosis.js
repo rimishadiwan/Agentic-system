@@ -1,11 +1,64 @@
 const { GoogleGenAI } = require("@google/genai");
-const { getModel } = require("./geminiConfig");
+const { getModel, generateWithRetry } = require("./geminiConfig");
 
 const { isHardBlocker } = require("./strategy");
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY
 });
+
+const VALID_CAUSES = [
+  "estimation_failure", "resource_constraint", "technical_blocker", "dependency_failure",
+  "requirement_change", "execution_failure", "strategy_failure", "external_factor", "unknown"
+];
+
+/*
+  Rule-based diagnosis used when Gemini is unavailable (or returns unusable JSON),
+  so /adapt still produces a decision instead of a 500. Never returns "unknown" when
+  the reality data gives any signal.
+*/
+function fallbackDiagnosis(data, hardBlocker) {
+  const reality = data.reality || {};
+  const text = [].concat(reality.blockers || [], reality.observations || []).join(" ; ");
+  const drift = Number(reality.driftPercentage) || 0;
+  const hardware = /gpu|vram|cuda|\bram\b|memory|\boom\b|cpu/i.test(text);
+  const dependency = /api|service|library|dependency|dataset|unavailable|deprecated|incompatible/i.test(text);
+  const base = { fallback: true, source: "rule_based" };
+
+  if (hardBlocker || reality.status === "blocked") {
+    return {
+      ...base,
+      rootCause: text || "Execution is blocked.",
+      causeType: hardware ? "technical_blocker" : dependency ? "dependency_failure" : "technical_blocker",
+      strategyAffected: true,
+      explanation: "Execution is blocked by an explicit blocker, so the current approach cannot continue.",
+      recommendation: "Switch to an alternative approach that works within the available resources.",
+      confidence: 0.7
+    };
+  }
+
+  if (drift > 0) {
+    return {
+      ...base,
+      rootCause: `Execution took ${drift}% ${(reality.actualHours ?? 0) >= (reality.expectedHours ?? 0) ? "longer" : "less"} than planned.`,
+      causeType: "estimation_failure",
+      strategyAffected: false,
+      explanation: "No blocker was reported, so the deviation is treated as a timing/estimation error. The underlying strategy is still considered valid.",
+      recommendation: "Keep the current strategy and adjust the remaining task estimates and schedule.",
+      confidence: 0.5
+    };
+  }
+
+  return {
+    ...base,
+    rootCause: text || "Deviation detected but no cause was reported.",
+    causeType: "unknown",
+    strategyAffected: false,
+    explanation: "Automatic diagnosis was unavailable and no clear signal was found in the reality data.",
+    recommendation: "Review the execution details and re-run diagnosis.",
+    confidence: 0.2
+  };
+}
 
 async function diagnose(data) {
   const prompt = `
@@ -87,17 +140,20 @@ Rules:
 
   let result = {};
   try {
-    const response = await ai.models.generateContent({
+    const response = await generateWithRetry(ai, {
       model: getModel(),
       contents: prompt,
       config: { responseMimeType: "application/json", temperature: 0.2 }
     });
     result = JSON.parse(String(response.text || "").replace(/```json|```/gi, "").trim());
+    if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Diagnosis was not a JSON object");
   } catch (err) {
-    // Without an explicit blocker the original behaviour is kept (error propagates).
-    if (!hardBlocker) throw err;
-    console.warn("Diagnosis LLM failed, using blocker rules:", err.message);
+    // Gemini overloaded / quota exhausted / bad JSON: degrade to rule-based diagnosis instead of failing /adapt.
+    console.warn("Diagnosis LLM failed, using rule-based fallback:", err.message);
+    return fallbackDiagnosis(data, hardBlocker);
   }
+
+  if (!VALID_CAUSES.includes(result.causeType)) result.causeType = "unknown";
 
   /*
     Deterministic guard: an explicit blocker (e.g. insufficient GPU memory) means
