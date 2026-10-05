@@ -1,3 +1,4 @@
+const { isTransient } = require("../services/geminiConfig");
 const { adapt } = require("../services/adaptation");
 const { replan } = require("../services/replanner");
 const { analyzeGoal } = require("../services/goalAnalyzer");
@@ -5,6 +6,22 @@ const { generatePlan } = require("../services/planner");
 const { diagnose } = require("../services/diagnosis");
 const { researchSolutions } = require("../services/researchEngine");
 const { analyzeReality } = require("../services/realityAnalyzer");
+
+// Temporary Gemini failures -> 503 + retryable so the frontend can show "try again" instead of a generic error.
+function sendError(res, error, extra = {}) {
+  if (error.transient || isTransient(error)) {
+    return res.status(503).json({
+      error: "The AI model is busy right now. Please try again in a few seconds.",
+      retryable: true,
+      ...extra
+    });
+  }
+  if (error.permanent) {
+    return res.status(503).json({ error: error.message, retryable: false, ...extra });
+  }
+  return res.status(500).json({ error: error.message, ...extra });
+}
+
 const analyzeGoalController = async (req, res) => {
   try {
     const {
@@ -34,9 +51,7 @@ const analyzeGoalController = async (req, res) => {
   } catch (error) {
     console.error("GOAL ANALYSIS ERROR:", error);
 
-    res.status(500).json({
-      error: error.message
-    });
+    sendError(res, error);
   }
 };
 const createPlan = async (req, res) => {
@@ -48,9 +63,7 @@ const createPlan = async (req, res) => {
   } catch (error) {
     console.error("PLAN GENERATION ERROR:", error);
 
-    res.status(500).json({
-      error: error.message
-    });
+    sendError(res, error);
   }
 };
 const analyzeRealityController = async (req, res) => {
@@ -62,9 +75,7 @@ const analyzeRealityController = async (req, res) => {
   } catch (error) {
     console.error("REALITY ANALYSIS ERROR:", error);
 
-    res.status(500).json({
-      error: error.message
-    });
+    sendError(res, error);
   }
 };
 const diagnoseController = async (req, res) => {
@@ -76,9 +87,7 @@ const diagnoseController = async (req, res) => {
   } catch (error) {
     console.error("DIAGNOSIS ERROR:", error);
 
-    res.status(500).json({
-      error: error.message
-    });
+    sendError(res, error);
   }
 };
 const replanController = async (req, res) => {
@@ -90,9 +99,7 @@ const replanController = async (req, res) => {
   } catch (error) {
     console.error("REPLAN ERROR:", error);
 
-    res.status(500).json({
-      error: error.message
-    });
+    sendError(res, error);
   }
 };
 const adaptController = async (req, res) => {
@@ -104,9 +111,7 @@ const adaptController = async (req, res) => {
   } catch (error) {
     console.error("ADAPTATION ERROR:", error);
 
-    res.status(500).json({
-      error: error.message
-    });
+    sendError(res, error);
   }
 };
 async function researchController(req, res) {
@@ -117,10 +122,7 @@ async function researchController(req, res) {
   } catch (error) {
     console.error("Research error:", error);
 
-    res.status(500).json({
-      error: "Research failed",
-      message: error.message
-    });
+    sendError(res, error, { message: error.message });
   }
 }
 module.exports = {
